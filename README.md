@@ -1,0 +1,228 @@
+# ASSTS 量化交易系统
+
+> A-Stock Selection & Trading System (A股选股与择时交易系统)
+
+基于深度学习（LSTM+Attention）与强化学习（PPO）的A股量化交易系统，实现"选股+择时"两阶段架构。
+
+## 📁 项目结构
+
+```
+ASSTS/
+├── model_file/                  # 预训练分类模型 (6个)
+│   ├── 0d_30d_14f_2s3e_BCE_0005-003_AUC_05434.pth
+│   ├── 0d_30d_14f_2s3h_BCE_0005-003_AUC_05844.pth
+│   ├── 0d_60d_14f_2s3e_BCE_0005-003_AUC_05343.pth
+│   ├── 0d_60d_14f_2s3h_BCE_0005-003_AUC_05736.pth
+│   ├── 0d_120d_14f_2s3e_BCE_0005-003_AUC_05437.pth
+│   └── 0d_120d_14f_2s3h_BCE_0005-003_AUC_05843.pth
+│
+├── dataset/                     # 数据集
+│   └── 0d-m-data-120d-preprocess-14f-2s3e-class-003-TEST.pkl  # 测试集
+│
+├── ppo_pool/                    # PPO训练股票池
+│   ├── ppo_pool_30d_2s3h_min1   # 30天窗口
+│   ├── ppo_pool_60d_2s3h_min1   # 60天窗口
+│   ├── ppo_pool_60d_2s3e_min1   # 60天窗口
+│   ├── ppo_pool_120d_2s3h_min1  # 120天窗口
+│   └── ppo_pool_combined_min1   # 综合池
+│
+├── ppo_model/                   # PPO模型
+│   ├── best_ppo_model.pth       # 最佳模型 (6.61%收益)
+│   └── ppo_model_final.pth
+│
+├── ppo_logs/                    # 训练日志
+│   ├── training_curves.png       # 训练曲线
+│   └── *.json                   # 详细日志
+│
+├── model/                       # 模型架构
+│   └── LSTM_Attention.py        # LSTM+Attention网络
+│
+├── data_min/                    # 分钟级数据 (2025年8-9月)
+│
+├── ppo_env.py                   # PPO交易环境
+├── ppo_train_v2.py              # PPO训练代码
+├── predict_filter.py            # 股票筛选代码
+└── create_ppo_pool.py           # 股票池打包代码
+```
+
+## 🏗️ 系统架构
+
+### 两阶段Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Stage 1: 分类模型 (Alpha)                 │
+├─────────────────────────────────────────────────────────────┤
+│  输入: 14维量价特征 × 30/60/120天历史                        │
+│  模型: LSTM + Attention                                      │
+│  输出: 上涨概率 (AUC > 0.58)                                │
+│  目标: 2s3h / 2s3e (预测Day2开盘→Day3最高/收盘涨幅)         │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+                    筛选阈值 > 0.5 的股票池
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                   Stage 2: PPO强化学习 (择时)                │
+├─────────────────────────────────────────────────────────────┤
+│  状态: 浮盈比例、回撤、时间衰减、波动率、持仓状态             │
+│  动作: [0:持有, 1:卖出]                                     │
+│  奖励: 卖出时结算真实盈亏                                    │
+│  输出: 最佳卖出时机                                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 📊 数据集详情
+
+### 1. 原始数据
+
+| 类型 | 时间范围 | 数量 |
+|------|----------|------|
+| 日线数据 | 2010-2025 | 5000+股票 |
+| 分钟数据 | 2025年8-9月 | 约5000股票 |
+
+### 2. 测试数据集
+
+```
+dataset/0d-m-data-120d-preprocess-14f-2s3e-class-003-TEST.pkl
+- 特征维度: 14维
+- 时间窗口: 120天
+- 样本数量: 104,267条
+- 标签类型: 2s3e (Day2开盘→Day3收盘)
+```
+
+### 3. 模型筛选结果 (阈值>0.5)
+
+| 模型 | 筛选股票数 | 唯一股票 |
+|------|------------|----------|
+| 30d_2s3h | 41,449 | 4,805 |
+| 60d_2s3e | 45,912 | 4,860 |
+| 60d_2s3h | 45,071 | 4,850 |
+| 120d_2s3h | 57,920 | 4,933 |
+
+### 4. PPO股票池
+
+```
+ppo_pool/
+├── ppo_pool_30d_2s3h_min1   # 4,805只股票, 235,100个分钟数据文件
+├── ppo_pool_60d_2s3h_min1   # 4,850只股票, 237,281个文件
+├── ppo_pool_60d_2s3e_min1   # 4,860只股票, 237,703个文件
+├── ppo_pool_120d_2s3h_min1  # 4,933只股票, 241,222个文件
+└── ppo_pool_combined_min1   # 4,956只股票, 242,319个文件
+```
+
+## 🧪 实验结果
+
+### 分类模型性能
+
+| 模型 | AUC | 特征窗口 |
+|------|-----|----------|
+| 30d_2s3h | **0.5844** | 30天 |
+| 60d_2s3h | 0.5736 | 60天 |
+| 120d_2s3h | 0.5843 | 120天 |
+| 30d_2s3e | 0.5434 | 30天 |
+| 60d_2s3e | 0.5343 | 60天 |
+| 120d_2s3e | 0.5437 | 120天 |
+
+> 结论: **30天窗口 + 2s3h** 表现最佳
+
+### PPO训练结果
+
+| 版本 | 训练轮数 | 最佳收益 | 正收益比例 |
+|------|----------|----------|------------|
+| v1 (基础) | 500 | 1.53% | 27.4% |
+| v1 (优化) | 1000 | 1.98% | 30.1% |
+| **v2 (深度)** | **502** | **6.61%** | **29.3%** |
+
+### 优化策略
+
+1. **多股票池课程学习**: 轮换使用不同特征窗口的股票池
+2. **奖励塑形**: 放大正奖励，缩小过大负奖励
+3. **学习率调度**: 指数衰减
+4. **网络加深**: 256隐藏层，4层网络
+5. **早停机制**: 100轮未创新高则停止
+
+## 🚀 快速开始
+
+### 环境配置
+
+```bash
+# 创建conda环境
+conda create -n ASSTS python=3.10
+conda activate ASSTS
+
+# 安装依赖
+pip install torch pandas numpy scikit-learn matplotlib seaborn ta
+```
+
+### 1. 股票筛选
+
+```bash
+python predict_filter.py
+```
+
+### 2. 打包股票池
+
+```bash
+python create_ppo_pool.py
+```
+
+### 3. PPO训练
+
+```bash
+python ppo_train_v2.py
+```
+
+### 4. 模型推理
+
+```python
+from ppo_env import StockTradingEnv
+from ppo_train import PPOAgent
+
+# 加载模型
+agent = PPOAgent(state_dim=50, action_dim=2)
+checkpoint = torch.load('ppo_model/best_ppo_model.pth')
+agent.actor.load_state_dict(checkpoint['actor'])
+
+# 推理
+state = env.reset()
+action, _, _ = agent.select_action(state, training=False)
+```
+
+## 📖 核心概念
+
+### 术语解释
+
+- **2s3h**: 买在Day2开盘，卖在Day3最高价
+- **2s3e**: 买在Day2开盘，卖在Day3收盘
+- **Buffer Zone**: 0.5%~3%涨幅的样本被剔除，避免噪音
+- **AUC**: 衡量模型全局排序能力
+
+### 状态设计 (PPO)
+
+```
+State = [profit_ratio, drawdown, time_decay, volatility, position] × 10 timesteps
+       = 50维向量
+```
+
+### 奖励机制
+
+```python
+if action == SELL:
+    reward = real_profit  # 卖出时结算真实盈亏
+elif profit < -3%:
+    reward = profit - 0.02  # 强制止损额外惩罚
+else:
+    reward = -0.0001  # 持仓时间惩罚
+```
+
+## 📝 参考文献
+
+见 `background.md` - 包含详细的技术文档和理论依据
+
+## 🤝 贡献者
+
+- 项目维护: ASSTS Team
+
+## 📄 License
+
+MIT License
