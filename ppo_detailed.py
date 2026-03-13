@@ -498,7 +498,7 @@ def train_and_evaluate(pool_path, model_name):
     
     return {
         'model': model_name,
-        'train': {'count': len(train_stocks), 'results': train_results[:10]},
+        'train': {'count': len(train_stocks), 'results': train_results},
         'val': {'count': len(val_stocks), 'results': val_results},
         'test': {'count': len(test_stocks), 'results': test_results},
     }
