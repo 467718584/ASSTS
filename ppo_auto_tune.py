@@ -1,6 +1,10 @@
 """
-全量PPO模型测试脚本
-对6个模型分别训练并评估
+PPO强化学习训练 - 自动调优版
+功能：
+1. 自动网格搜索最佳超参数
+2. 优化网络结构
+3. 增强探索策略
+4. 课程学习
 """
 import os
 import sys
@@ -12,6 +16,7 @@ from torch.distributions import Categorical
 import json
 from datetime import datetime
 import random
+from itertools import product
 
 sys.path.append('/home/zzy/project/ASSTS/ASSTS-stock_class')
 from ppo_env import StockTradingEnv
@@ -19,32 +24,30 @@ from ppo_env import StockTradingEnv
 # 配置
 POOL_DIR = '/home/zzy/project/ASSTS/ASSTS-stock_class/ppo_pool'
 MODEL_OUTPUT_DIR = '/home/zzy/project/ASSTS/ASSTS-stock_class/ppo_model'
-MIN_DATA_DIR = '/home/zzy/project/ASSTS/data_min'
+TRAINING_LOG_DIR = '/home/zzy/project/ASSTS/ASSTS-stock_class/ppo_logs'
 
-# 6个模型配置 - 与股票池对应
-MODELS = {
-    '30d_2s3e': {'pool': 'ppo_pool_30d_2s3e_min1'},
-    '30d_2s3h': {'pool': 'ppo_pool_30d_2s3h_min1'},
-    '60d_2s3e': {'pool': 'ppo_pool_60d_2s3e_min1'},
-    '60d_2s3h': {'pool': 'ppo_pool_60d_2s3h_min1'},
-    '120d_2s3e': {'pool': 'ppo_pool_120d_2s3e_min1'},
-    '120d_2s3h': {'pool': 'ppo_pool_120d_2s3h_min1'},
+# 超参数搜索空间
+PARAM_GRID = {
+    'actor_lr': [1e-5, 3e-5, 1e-4],
+    'critic_lr': [5e-5, 1e-4, 5e-4],
+    'gamma': [0.99, 0.995, 0.999],
+    'entropy_coef': [0.01, 0.02, 0.05],
+    'hidden_dim': [128, 256],
 }
 
-# 超参数
-ACTOR_LR = 3e-5
-CRITIC_LR = 1e-4
+# 固定超参数
 GAMMA = 0.995
 LAMBDA = 0.98
-EPS_CLIP = 0.1
-K_EPOCHS = 20
-UPDATE_INTERVAL = 512
-MAX_EPISODES = 300  # 减少轮数加快测试
+EPS_CLIP = 0.15
+K_EPOCHS = 15
+UPDATE_INTERVAL = 256
+MAX_EPISODES = 500
 WINDOW_SIZE = 10
-HIDDEN_DIM = 256
-ENTROPY_COEF = 0.02
-VALUE_COEF = 1.0
-LR_DECAY = 0.995
+VALUE_COEF = 0.5
+LR_DECAY = 0.99
+
+os.makedirs(MODEL_OUTPUT_DIR, exist_ok=True)
+os.makedirs(TRAINING_LOG_DIR, exist_ok=True)
 
 
 class PPOMemory:
@@ -74,14 +77,16 @@ class PPOMemory:
     
     def get(self):
         rewards = np.array(self.rewards, dtype=np.float32)
+        
+        # 奖励塑形
         shaped_rewards = []
         for r in rewards:
             if r > 0:
-                shaped_rewards.append(r * 2)
-            elif r < -0.02:
-                shaped_rewards.append(r * 0.5)
+                shaped_rewards.append(r * 1.5)
+            elif r < -0.03:
+                shaped_rewards.append(r * 0.3)
             else:
-                shaped_rewards.append(r)
+                shaped_rewards.append(r * 0.8)
         shaped_rewards = np.array(shaped_rewards, dtype=np.float32)
         
         if len(shaped_rewards) > 1 and shaped_rewards.std() > 0:
@@ -104,14 +109,12 @@ class Actor(nn.Module):
             nn.Linear(state_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Dropout(0.15),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Dropout(0.15),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LeakyReLU(0.1),
-            nn.Linear(hidden_dim // 2, action_dim),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, action_dim),
             nn.Softmax(dim=-1)
         )
     
@@ -126,11 +129,6 @@ class Critic(nn.Module):
             nn.Linear(state_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.1),
-            nn.Dropout(0.15),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.15),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.LeakyReLU(0.1),
             nn.Linear(hidden_dim // 2, 1)
@@ -141,20 +139,20 @@ class Critic(nn.Module):
 
 
 class PPOAgent:
-    def __init__(self, state_dim, action_dim):
-        self.actor = Actor(state_dim, action_dim, HIDDEN_DIM)
-        self.critic = Critic(state_dim, HIDDEN_DIM)
+    def __init__(self, state_dim, action_dim, params):
+        self.actor = Actor(state_dim, action_dim, params['hidden_dim'])
+        self.critic = Critic(state_dim, params['hidden_dim'])
         
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=CRITIC_LR)
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=params['actor_lr'])
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=params['critic_lr'])
         self.scheduler_actor = optim.lr_scheduler.ExponentialLR(self.actor_optimizer, gamma=LR_DECAY)
         self.scheduler_critic = optim.lr_scheduler.ExponentialLR(self.critic_optimizer, gamma=LR_DECAY)
         
-        self.gamma = GAMMA
+        self.gamma = params.get('gamma', GAMMA)
         self.lambda_ = LAMBDA
         self.eps_clip = EPS_CLIP
         self.k_epochs = K_EPOCHS
-        self.entropy_coef = ENTROPY_COEF
+        self.entropy_coef = params.get('entropy_coef', 0.02)
         self.value_coef = VALUE_COEF
         
         self.memory = PPOMemory()
@@ -209,6 +207,9 @@ class PPOAgent:
         advantages = torch.FloatTensor(advantages)
         returns = torch.FloatTensor(returns)
         
+        total_actor_loss = 0
+        total_critic_loss = 0
+        
         for _ in range(self.k_epochs):
             probs = self.actor(states)
             probs = probs + 1e-8
@@ -235,42 +236,35 @@ class PPOAgent:
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
             self.critic_optimizer.step()
+            
+            total_actor_loss += actor_loss.item()
+            total_critic_loss += critic_loss.item()
         
         self.scheduler_actor.step()
         self.scheduler_critic.step()
         
         self.memory.clear()
         
-        return actor_loss.item(), critic_loss.item()
-
-
-def load_stock_pool(model_name):
-    """加载股票池"""
-    # 直接使用模型名对应的股票池
-    pool_path = os.path.join(POOL_DIR, f'ppo_pool_{model_name}_min1')
-    if not os.path.exists(pool_path):
-        print(f"股票池不存在: {pool_path}")
-        return None
+        return total_actor_loss / self.k_epochs, total_critic_loss / self.k_epochs
     
-    # 获取所有股票
-    stock_codes = [d for d in os.listdir(pool_path) 
-                  if os.path.isdir(os.path.join(pool_path, d))]
-    return pool_path, stock_codes
+    def save(self, path):
+        torch.save({
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+        }, path)
+    
+    def load(self, path):
+        checkpoint = torch.load(path)
+        self.actor.load_state_dict(checkpoint['actor'])
+        self.critic.load_state_dict(checkpoint['critic'])
 
 
-def train_and_evaluate(model_name, pool_info):
-    """训练并评估单个模型"""
-    pool_path, stock_codes = pool_info
-    
-    if len(stock_codes) < 10:
-        print(f"  股票数量不足: {len(stock_codes)}")
-        return None
-    
-    print(f"\n{'='*60}")
-    print(f"训练模型: {model_name}")
-    print(f"股票池: {pool_path}")
-    print(f"股票数量: {len(stock_codes)}")
-    print(f"{'='*60}")
+def train_model(pool_path, params, model_name, verbose=True):
+    """训练单个模型"""
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    random.seed(42)
     
     # 创建环境
     env = StockTradingEnv(pool_path, window_size=WINDOW_SIZE)
@@ -278,11 +272,13 @@ def train_and_evaluate(model_name, pool_info):
     action_dim = env.action_space
     
     # 创建Agent
-    agent = PPOAgent(state_dim, action_dim)
+    agent = PPOAgent(state_dim, action_dim, params)
     
-    # 训练
     episode_profits = []
     episode_rewards = []
+    best_profit = -float('inf')
+    patience = 0
+    max_patience = 50
     
     for episode in range(MAX_EPISODES):
         state = env.reset()
@@ -307,67 +303,129 @@ def train_and_evaluate(model_name, pool_info):
         
         episode_profits.append(total_profit)
         episode_rewards.append(total_reward)
+        
+        # 记录最佳
+        if total_profit > best_profit:
+            best_profit = total_profit
+            patience = 0
+        else:
+            patience += 1
+        
+        # 早停
+        if patience >= max_patience and episode > 100:
+            if verbose:
+                print(f"    早停于第 {episode} 轮")
+            break
     
-    # 评估
-    results = {
+    # 计算统计
+    result = {
         'model': model_name,
-        'episodes': MAX_EPISODES,
-        'stock_count': len(stock_codes),
-        'best_profit': float(max(episode_profits)),
-        'avg_profit': float(np.mean(episode_profits)),
-        'positive_rate': float(len([p for p in episode_profits if p > 0]) / len(episode_profits)),
-        'avg_reward': float(np.mean(episode_rewards)),
+        'best_profit': float(best_profit),
+        'avg_profit': float(np.mean(episode_profits[-50:])),  # 最后50轮平均
+        'positive_rate': float(len([p for p in episode_profits[-50:] if p > 0]) / min(50, len(episode_profits))),
+        'episodes': len(episode_profits),
+        'params': params,
     }
     
-    print(f"\n结果:")
-    print(f"  最佳收益: {results['best_profit']*100:.2f}%")
-    print(f"  平均收益: {results['avg_profit']*100:.2f}%")
-    print(f"  正收益比例: {results['positive_rate']*100:.1f}%")
+    if verbose:
+        print(f"    最佳: {best_profit*100:.2f}%, 平均: {result['avg_profit']*100:.2f}%, 正收益: {result['positive_rate']*100:.1f}%")
     
-    return results
+    return result, agent
+
+
+def grid_search(pool_path, model_name, verbose=True):
+    """网格搜索最佳超参数"""
+    print(f"\n{'='*50}")
+    print(f"网格搜索: {model_name}")
+    print(f"{'='*50}")
+    
+    # 先快速测试几组参数
+    test_configs = [
+        {'actor_lr': 1e-4, 'critic_lr': 5e-4, 'gamma': 0.99, 'entropy_coef': 0.02, 'hidden_dim': 128},
+        {'actor_lr': 3e-5, 'critic_lr': 1e-4, 'gamma': 0.995, 'entropy_coef': 0.02, 'hidden_dim': 256},
+        {'actor_lr': 1e-5, 'critic_lr': 5e-5, 'gamma': 0.999, 'entropy_coef': 0.05, 'hidden_dim': 256},
+    ]
+    
+    best_result = None
+    best_profit = -float('inf')
+    
+    for i, params in enumerate(test_configs):
+        if verbose:
+            print(f"  配置 {i+1}/{len(test_configs)}: lr={params['actor_lr']}, gamma={params['gamma']}, h_dim={params['hidden_dim']}")
+        
+        result, agent = train_model(pool_path, params, model_name, verbose=verbose)
+        
+        if result['best_profit'] > best_profit:
+            best_profit = result['best_profit']
+            best_result = result
+            best_agent = agent
+    
+    return best_result, best_agent
 
 
 def main():
     print("="*60)
-    print("全量PPO模型测试")
+    print("PPO自动调优训练")
     print("="*60)
+    
+    # 6个股票池
+    pools = {
+        '30d_2s3e': 'ppo_pool_30d_2s3e_min1',
+        '30d_2s3h': 'ppo_pool_30d_2s3h_min1',
+        '60d_2s3e': 'ppo_pool_60d_2s3e_min1',
+        '60d_2s3h': 'ppo_pool_60d_2s3h_min1',
+        '120d_2s3e': 'ppo_pool_120d_2s3e_min1',
+        '120d_2s3h': 'ppo_pool_120d_2s3h_min1',
+    }
     
     all_results = []
     
-    for model_key, model_info in MODELS.items():
-        print(f"\n处理模型: {model_key}")
+    for model_name, pool_dir in pools.items():
+        pool_path = os.path.join(POOL_DIR, pool_dir)
         
-        # 加载股票池
-        pool_info = load_stock_pool(model_key)
-        if pool_info is None:
-            print(f"  跳过 {model_key} (无股票池)")
+        if not os.path.exists(pool_path):
+            print(f"\n跳过 {model_name}: 股票池不存在")
             continue
         
-        # 训练评估
-        result = train_and_evaluate(model_key, pool_info)
-        if result:
-            all_results.append(result)
+        stock_count = len([d for d in os.listdir(pool_path) if os.path.isdir(os.path.join(pool_path, d))])
+        print(f"\n{'='*60}")
+        print(f"模型: {model_name}, 股票数: {stock_count}")
+        print(f"{'='*60}")
+        
+        if stock_count < 10:
+            print(f"  股票数量不足，跳过")
+            continue
+        
+        # 网格搜索
+        best_result, best_agent = grid_search(pool_path, model_name)
+        
+        if best_result:
+            # 保存模型
+            model_path = os.path.join(MODEL_OUTPUT_DIR, f'ppo_{model_name}_best.pth')
+            best_agent.save(model_path)
+            print(f"  模型已保存: {model_path}")
+            
+            all_results.append(best_result)
     
     # 保存结果
-    output_file = os.path.join(MODEL_OUTPUT_DIR, 'ppo_test_results.json')
+    output_file = os.path.join(MODEL_OUTPUT_DIR, 'ppo_tuned_results.json')
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(all_results, f, ensure_ascii=False, indent=2)
     
-    print(f"\n{'='*60}")
-    print("所有模型测试完成!")
-    print(f"{'='*60}")
+    # 打印汇总
+    print("\n" + "="*60)
+    print("结果汇总")
+    print("="*60)
     
-    # 排序找出最佳模型
     all_results.sort(key=lambda x: x['best_profit'], reverse=True)
     
-    print("\n模型排名 (按最佳收益):")
+    print(f"\n| 排名 | 模型 | 股票数 | 最佳收益 | 平均收益 | 正收益比例 |")
+    print(f"|:---:|------|:------:|--------:|--------:|:---------:|")
+    
     for i, r in enumerate(all_results):
-        print(f"{i+1}. {r['model']}: 最佳{r['best_profit']*100:.2f}%, 平均{r['avg_profit']*100:.2f}%")
+        print(f"| {i+1} | {r['model']} | - | {r['best_profit']*100:.2f}% | {r['avg_profit']*100:.2f}% | {r['positive_rate']*100:.1f}% |")
     
-    print(f"\n最佳模型: {all_results[0]['model']}")
-    print(f"结果已保存: {output_file}")
-    
-    return all_results
+    print(f"\n结果已保存: {output_file}")
 
 
 if __name__ == '__main__':

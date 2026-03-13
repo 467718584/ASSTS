@@ -1,6 +1,14 @@
 """
-PPO强化学习交易环境
-专门用于学习最佳卖出时机
+PPO强化学习交易环境 - 严格版
+逻辑：
+- Day1: 模型推荐股票
+- Day2: 开盘买入
+- Day3: 选择卖出时机
+
+环境设计：
+- 每只股票的分钟数据必须包含3天
+- Day2的数据用于买入（开盘价）
+- Day3的数据用于选择卖出时机
 """
 import os
 import numpy as np
@@ -11,14 +19,20 @@ import random
 class StockTradingEnv:
     """
     股票日内择时交易环境
-    状态: 纯比例特征 (浮盈比例, 回撤比例, 时间衰减比例)
+    
+    数据结构（3天）：
+    - 文件[0] = Day1数据（推荐日，无用）
+    - 文件[1] = Day2数据（买入日，开盘价买入）
+    - 文件[2] = Day3数据（卖出日，选择卖出时机）
+    
+    状态: 比例特征
     动作: 0=持有, 1=卖出
     奖励: 卖出时结算真实盈亏
     """
     
     def __init__(self, stock_data_dir, window_size=10, initial_capital=10000):
         """
-        :param stock_data_dir: 股票分钟数据目录
+        :param stock_data_dir: 股票分钟数据目录（每只股票必须有3天数据）
         :param window_size: 状态窗口大小
         :param initial_capital: 初始资金
         """
@@ -26,99 +40,90 @@ class StockTradingEnv:
         self.window_size = window_size
         self.initial_capital = initial_capital
         
-        # 获取所有股票
-        self.stock_codes = [d for d in os.listdir(stock_data_dir) 
-                           if os.path.isdir(os.path.join(stock_data_dir, d))]
+        # 获取所有股票（必须有3天数据）
+        self.stock_codes = []
+        for d in os.listdir(stock_data_dir):
+            full_path = os.path.join(stock_data_dir, d)
+            if os.path.isdir(full_path):
+                csv_files = [f for f in os.listdir(full_path) if f.endswith('.csv')]
+                if len(csv_files) >= 3:  # 必须有3天
+                    self.stock_codes.append(d)
+        
+        if len(self.stock_codes) == 0:
+            raise ValueError(f"No valid stocks with 3 days data in {stock_data_dir}")
+        
+        print(f"    环境加载: {len(self.stock_codes)} 只股票（3天数据）")
         
         # 环境参数
         self.action_space = 2  # 0:持有, 1:卖出
-        self.observation_space = window_size * 5  # 5个特征 * window (profit, drawdown, time_decay, volatility, position)
+        self.observation_space = window_size * 5
         
         # 交易参数
-        self.stop_loss = -0.03  # -3%止损
-        self.transaction_fee = 0.001  # 手续费
-        
-        # 状态归一化参数
-        self.max_drawdown = 0.1  # 最大回撤10%
-        self.max_time_decay = 1.0  # 最大时间衰减
+        self.stop_loss = -0.03
+        self.transaction_fee = 0.001
         
         self.reset()
     
     def _load_stock_data(self, stock_code):
-        """加载单只股票的分钟数据"""
+        """
+        加载单只股票的3天分钟数据
+        返回: [Day1数据, Day2数据, Day3数据]
+        """
         stock_dir = os.path.join(self.stock_data_dir, stock_code)
-        all_data = []
+        csv_files = sorted([f for f in os.listdir(stock_dir) if f.endswith('.csv')])
         
-        for csv_file in sorted(os.listdir(stock_dir)):
-            if csv_file.endswith('.csv'):
-                df = pd.read_csv(os.path.join(stock_dir, csv_file))
-                if len(df) > 0:
-                    all_data.append(df)
-        
-        if not all_data:
+        if len(csv_files) < 3:
             return None
-            
-        data = pd.concat(all_data, ignore_index=True)
-        return data
+        
+        day1_data = pd.read_csv(os.path.join(stock_dir, csv_files[0]))  # Day1 - 推荐日
+        day2_data = pd.read_csv(os.path.join(stock_dir, csv_files[1]))  # Day2 - 买入日
+        day3_data = pd.read_csv(os.path.join(stock_dir, csv_files[2]))  # Day3 - 卖出日
+        
+        return {
+            'day1': day1_data,
+            'day2': day2_data,  # 买入日
+            'day3': day3_data,  # 卖出日
+        }
     
     def _get_observation(self):
-        """
-        获取状态观测
-        状态包含:
-        - 当前浮盈比例 (profit_ratio)
-        - 距离最高点回撤 (drawdown_from_peak)
-        - 时间衰减比例 (time_decay)
-        - 实时波动率 (volatility)
-        - 当前是否持仓 (position)
-        """
-        # 计算浮盈比例
+        """获取状态观测"""
         if self.current_price > 0 and self.buy_price > 0:
             self.profit_ratio = (self.current_price - self.buy_price) / self.buy_price
         else:
             self.profit_ratio = 0
             
-        # 计算回撤
         if self.peak_price > 0:
             self.drawdown = (self.peak_price - self.current_price) / self.peak_price
         else:
             self.drawdown = 0
         
-        # 防止NaN和Inf
         self.profit_ratio = max(-1, min(1, self.profit_ratio)) if np.isfinite(self.profit_ratio) else 0
         self.drawdown = max(0, min(1, self.drawdown)) if np.isfinite(self.drawdown) else 0
             
-        # 时间衰减 (已交易时间 / 总交易时间)
-        self.time_decay = self.current_step / self.max_steps if self.max_steps > 0 else 0
+        self.time_decay = self.day3_step / self.day3_max_steps if self.day3_max_steps > 0 else 0
         
-        # 波动率 (最近N个bar的价格波动)
         if len(self.price_history) >= 5:
-            prices = list(self.price_history)[-5:] if hasattr(self.price_history, '__iter__') else self.price_history[-5:]
+            prices = list(self.price_history)[-5:]
             self.volatility = np.std(prices) / self.buy_price if self.buy_price > 0 else 0
         else:
             self.volatility = 0
         
-        # 防止NaN和Inf
         self.volatility = max(0, min(1, self.volatility)) if np.isfinite(self.volatility) else 0
         
-        # 构建状态向量
         obs = np.array([
             self.profit_ratio,
             self.drawdown,
             self.time_decay,
             self.volatility,
-            1.0 if self.position == 1 else 0.0  # 当前持仓状态
+            1.0 if self.position == 1 else 0.0
         ], dtype=np.float32)
         
-        # 添加到历史
         self.obs_history.append(obs)
         
-        # 确保历史记录只保留window_size个
         if len(self.obs_history) > self.window_size:
             self.obs_history = self.obs_history[-self.window_size:]
         
-        # 填充窗口 - 确保固定输出大小
         if len(self.obs_history) < self.window_size:
-            # 前面填充0
             padding = np.zeros((self.window_size - len(self.obs_history), 5), dtype=np.float32)
             obs_history = np.vstack([padding, np.array(self.obs_history, dtype=np.float32)])
         else:
@@ -128,180 +133,96 @@ class StockTradingEnv:
     
     def reset(self):
         """重置环境"""
-        # 随机选择一只股票
         self.current_stock = random.choice(self.stock_codes)
         self.data = self._load_stock_data(self.current_stock)
         
-        if self.data is None or len(self.data) < 60:
-            return self.reset()  # 重新选择
+        if self.data is None or len(self.data['day2']) < 10 or len(self.data['day3']) < 10:
+            return self.reset()
         
-        # 初始化交易状态
+        # ============ Day2: 开盘买入 ============
+        day2_data = self.data['day2']
+        
+        # 开盘价买入（第一个价格）
+        self.buy_price = day2_data['收盘'].iloc[0]  # 开盘价
+        
         self.cash = self.initial_capital
-        self.position = 0  # 0:空仓, 1:持仓
-        self.buy_price = 0
-        self.current_price = 0
-        self.peak_price = 0
+        self.position = 1  # 持仓
+        self.current_price = self.buy_price
+        self.peak_price = self.buy_price
         self.profit_ratio = 0
         self.drawdown = 0
         self.time_decay = 0
         self.volatility = 0
         
-        # 时间步
-        self.current_step = 0
-        self.max_steps = min(len(self.data) - 1, 240)  # 最多4小时
+        # Day3交易参数
+        day3_data = self.data['day3']
+        self.day3_max_steps = min(len(day3_data) - 1, 240)
+        self.day3_step = 0
         
-        # 历史记录
         self.price_history = deque(maxlen=60)
         self.obs_history = []
         self.done = False
         self.total_profit = 0
         
-        # 跳过开盘前30分钟 (9:30-10:00不稳定)
-        self.current_step = 30
+        # Day3跳过开盘前15分钟
+        self.day3_step = 15
         
-        if self.current_step < self.max_steps:
-            self.current_price = self.data.iloc[self.current_step]['收盘']
+        if self.day3_step < self.day3_max_steps:
+            self.current_price = day3_data.iloc[self.day3_step]['收盘']
             self.price_history.append(self.current_price)
-            self.peak_price = self.current_price
-            
-            # 随机决定是否开盘买入
-            if random.random() > 0.3:
-                self.position = 1
-                self.buy_price = self.current_price
+            self.peak_price = max(self.peak_price, self.current_price)
         
         obs = self._get_observation()
         return obs
     
     def step(self, action):
         """
-        执行动作
+        执行动作 - 在Day3选择卖出时机
         action: 0=持有, 1=卖出
         """
-        # 如果空仓，随机买入
         if self.position == 0:
-            # 买入
             self.position = 1
             self.buy_price = self.current_price
-            self.peak_price = self.current_price
+            self.peak_price = self.buy_price
             obs = self._get_observation()
             reward = 0
             return obs, reward, self.done, {}
         
-        # 记录之前的状态
-        prev_profit = self.profit_ratio
+        self.day3_step += 1
         
-        # 更新价格
-        self.current_step += 1
-        if self.current_step >= self.max_steps:
-            # 强制平仓
-            if self.position == 1:
-                reward = self.profit_ratio
-                self.position = 0
-            else:
-                reward = 0
+        if self.day3_step >= self.day3_max_steps:
+            reward = self.profit_ratio - self.transaction_fee
+            self.position = 0
             self.done = True
+            self.total_profit = reward
             obs = self._get_observation()
-            return obs, reward, self.done, {}
+            info = {'profit': reward, 'stock': self.current_stock}
+            return obs, reward, self.done, info
         
-        # 获取当前价格
-        self.current_price = self.data.iloc[self.current_step]['收盘']
+        day3_data = self.data['day3']
+        self.current_price = day3_data.iloc[self.day3_step]['收盘']
         self.price_history.append(self.current_price)
+        self.peak_price = max(self.peak_price, self.current_price)
         
-        # 更新最高价
-        if self.current_price > self.peak_price:
-            self.peak_price = self.current_price
-        
-        reward = 0
-        info = {}
-        
-        if action == 1 and self.position == 1:
-            # 卖出
-            profit = (self.current_price - self.buy_price) / self.buy_price
-            profit -= self.transaction_fee  # 扣除手续费
-            
-            # 奖励 = 真实盈亏
-            reward = profit
-            self.total_profit = profit
-            
+        # 止损检查
+        if self.profit_ratio <= self.stop_loss:
+            reward = self.profit_ratio - self.transaction_fee
             self.position = 0
             self.done = True
-            info = {
-                'profit': profit,
-                'buy_price': self.buy_price,
-                'sell_price': self.current_price,
-                'stock': self.current_stock,
-                'step': self.current_step
-            }
+            self.total_profit = reward
+            obs = self._get_observation()
+            info = {'profit': reward, 'stock': self.current_stock, 'stop_loss': True}
+            return obs, reward, self.done, info
         
-        # 强制止损
-        if self.position == 1 and self.profit_ratio < self.stop_loss:
-            profit = self.profit_ratio - self.transaction_fee
-            reward = profit - 0.02  # 额外惩罚
+        if action == 1:  # 卖出
+            reward = self.profit_ratio - self.transaction_fee
             self.position = 0
             self.done = True
-            info = {
-                'profit': profit,
-                'buy_price': self.buy_price,
-                'sell_price': self.current_price,
-                'stock': self.current_stock,
-                'step': self.current_step,
-                'stop_loss': True
-            }
-        
-        # 持仓时间惩罚 (防止死扛)
-        if self.position == 1 and not self.done:
-            reward -= 0.0001  # 每个时间步轻微惩罚
+            self.total_profit = reward
+        else:  # 持有
+            reward = -0.0001
         
         obs = self._get_observation()
-        
-        # 保存观测历史
-        if self.position == 1:
-            self.obs_history.append(np.array([
-                self.profit_ratio,
-                self.drawdown,
-                self.time_decay,
-                self.volatility,
-                1.0
-            ]))
+        info = {'profit': self.total_profit if self.done else 0}
         
         return obs, reward, self.done, info
-    
-    def render(self, mode='human'):
-        """渲染环境"""
-        print(f"Stock: {self.current_stock}, Step: {self.current_step}/{self.max_steps}")
-        print(f"Position: {self.position}, Price: {self.current_price:.2f}")
-        print(f"Profit: {self.profit_ratio*100:.2f}%, Drawdown: {self.drawdown*100:.2f}%")
-        print(f"Time Decay: {self.time_decay*100:.1f}%")
-        print("-" * 40)
-
-
-class MultiStockEnv:
-    """多股票并行环境 - 加速训练"""
-    
-    def __init__(self, pool_dirs, window_size=10):
-        """
-        :param pool_dirs: 股票池目录列表
-        """
-        self.envs = [StockTradingEnv(d, window_size) for d in pool_dirs]
-        self.n_envs = len(self.envs)
-        
-    def reset(self):
-        return np.array([env.reset() for env in self.envs])
-    
-    def step(self, actions):
-        obs_list = []
-        reward_list = []
-        done_list = []
-        info_list = []
-        
-        for env, action in zip(self.envs, actions):
-            obs, reward, done, info = env.step(action)
-            obs_list.append(obs)
-            reward_list.append(reward)
-            done_list.append(done)
-            info_list.append(info)
-            
-            if done:
-                env.reset()
-        
-        return np.array(obs_list), np.array(reward_list), np.array(done_list), info_list

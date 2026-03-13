@@ -7,3 +7,10 @@ data_min/
 ppo_pool/
 model/dataset/
 logs/
+ASSTS-data/
+tushare_output_dir/
+stock_dir/
+tools/
+ppo_logs/
+ppo_model/*.json
+ppo_model/details_*.json

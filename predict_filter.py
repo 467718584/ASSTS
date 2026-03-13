@@ -21,13 +21,13 @@ OUTPUT_DIR = '/home/zzy/project/ASSTS/ASSTS-stock_class/ppo_pool'
 THRESHOLD = 0.5
 BATCH_SIZE = 1000  # 分批处理
 
-# 模型列表 - 6个预训练模型
+# 模型列表 - 6个预训练模型 (使用实际存在的模型文件)
 MODELS = {
-    '30d_2s3e': {'file': '0d_30d_14f_2s3e_BCE_0005-003_AUC_05434.pth', 'length': 30},
+    '30d_2s3e': {'file': '0d_30d_14f_2s3e_BCE_0005-003_AUC_05437.pth', 'length': 30},
     '30d_2s3h': {'file': '0d_30d_14f_2s3h_BCE_0005-003_AUC_05844.pth', 'length': 30},
     '60d_2s3e': {'file': '0d_60d_14f_2s3e_BCE_0005-003_AUC_05343.pth', 'length': 60},
     '60d_2s3h': {'file': '0d_60d_14f_2s3h_BCE_0005-003_AUC_05736.pth', 'length': 60},
-    '120d_2s3e': {'file': '0d_120d_14f_2s3e_BCE_0005-003_AUC_05437.pth', 'length': 120},
+    '120d_2s3e': {'file': '0d_120d_14f_2s3e_BCE_0005-003_AUC_05434.pth', 'length': 120},
     '120d_2s3h': {'file': '0d_120d_14f_2s3h_BCE_0005-003_AUC_05843.pth', 'length': 120},
 }
 
