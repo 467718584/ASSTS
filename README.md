@@ -177,12 +177,18 @@ cat ppo_model/ppo_v3_results.json
 ## 📝 更新日志
 
 ### 2026-03-15
-- V8版本训练完成 (800 epochs × 6模型)
+- **V9版本训练完成** (800 epochs × 6模型) - 最终优化版
+  - 更激进奖励函数：大幅提高相对收益权重
+  - 趋势保护机制：下跌趋势不卖出获得保护奖励
+  - 更大特征窗口：8维特征(window_size=20)
+  - 结果文件: `v9_details.json`, `v9_all_details.json`
+- **V8版本训练完成** (800 epochs × 6模型)
 - V8核心改进：
   - stop_loss = -0.01 (从-0.03改为-0.01)
   - transaction_fee = 0 (取消手续费)
   - day3_step = 0 (从15改为0，更早开始交易)
 - V7/V8/V9三策略对比分析
+- 完整版本对比生成
 - 最佳配置: stop_loss=-0.02, transaction_fee=0, Entropy=0.01
 
 ### 2026-03-14
