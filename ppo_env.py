@@ -59,8 +59,8 @@ class StockTradingEnv:
         self.observation_space = window_size * 5
         
         # 交易参数
-        self.stop_loss = -0.03
-        self.transaction_fee = 0.001
+        self.stop_loss = -0.01
+        self.transaction_fee = 0
         
         self.reset()
     
@@ -165,7 +165,7 @@ class StockTradingEnv:
         self.total_profit = 0
         
         # Day3跳过开盘前15分钟
-        self.day3_step = 15
+        self.day3_step = 0
         
         if self.day3_step < self.day3_max_steps:
             self.current_price = day3_data.iloc[self.day3_step]['收盘']
