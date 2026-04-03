@@ -4,12 +4,12 @@
 Stage 2 LSTM+Attention 模型
 
 功能:
-  - 训练: 从HDF5数据学习预测d_profit
+  - 训练: 从HDF5数据学习预测d_profit（时间划分 + L2正则 + 早停）
   - 评估: 输出AUC/MAE等指标
   - 预测: 对候选股票排序，输出Top候选
 
 模型结构:
-  Input(60, 8)
+  Input(60, 9)
     → LSTM(128, return_sequences=True) + MultiHeadAttention
     → LSTM(64, return_sequences=False) + MultiHeadAttention
     → Dense(64, ReLU) + Dropout(0.3)
@@ -17,6 +17,16 @@ Stage 2 LSTM+Attention 模型
     → Dense(1)  [回归版]
     或
     → Dense(2, softmax)  [二分类版]
+
+数据划分（时间-based）:
+  - Train: 2010-01-01 ~ 2021-12-31
+  - Val:   2022-01-01 ~ 2023-12-31
+  - Test:  2024-01-01 ~ 2025-12-31
+
+正则化配置:
+  - weight_decay = 1e-4 (L2正则)
+  - patience = 3 (早停，3个epoch无改善则停止)
+  - Dropout = 0.3
 
 使用方法:
   python lstm_attention_model.py --mode train --task regression
@@ -59,9 +69,18 @@ DENSE_DIM = 32
 DROPOUT = 0.3
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-3
+WEIGHT_DECAY = 1e-4   # L2正则化（增强，防止过拟合）
 MAX_EPOCHS = 30
-PATIENCE = 10
+PATIENCE = 3          # 早停（3个epoch无改善则停止）
 NUM_WORKERS = 0
+
+# 时间划分配置
+TRAIN_START = "2010-01-01"
+TRAIN_END   = "2021-12-31"
+VAL_START   = "2022-01-01"
+VAL_END     = "2023-12-31"
+TEST_START  = "2024-01-01"
+TEST_END    = "2025-12-31"
 
 # 设备
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -125,6 +144,144 @@ def collate_fn_topk(batch):
     xs, metas = zip(*batch)
     x_batch = torch.stack(xs, dim=0)  # (batch, 60, 8)
     return x_batch, list(metas)
+
+
+# ============================================================
+# 时间划分数据集（按日期split，无需预先划分）
+# ============================================================
+
+class TimeBasedDataset(Dataset):
+    """
+    从HDF5加载数据，按日期区间划分train/val/test
+    适用于: 2010-2021 train, 2022-2023 val, 2024-2025 test
+    """
+    def __init__(self, h5_path, split="train"):
+        super().__init__()
+        self.split = split
+        
+        # 根据split确定日期范围
+        if split == "train":
+            self.start_date = TRAIN_START
+            self.end_date = TRAIN_END
+        elif split == "val":
+            self.start_date = VAL_START
+            self.end_date = VAL_END
+        elif split == "test":
+            self.start_date = TEST_START
+            self.end_date = TEST_END
+        else:
+            raise ValueError(f"Unknown split: {split}")
+        
+        import h5py
+        with h5py.File(h5_path, "r") as f:
+            # 兼容两种格式
+            if "train" in f:
+                grp = f["train"]
+            else:
+                grp = f
+            
+            features = grp["features"][:]
+            labels = grp["labels"][:]
+            meta_raw = grp["meta"][:]
+        
+        # 解析meta，筛选日期范围内的样本
+        from datetime import datetime
+        self.features = []
+        self.labels = []
+        self.meta = []
+        
+        for i in range(len(meta_raw)):
+            m = json.loads(meta_raw[i].decode("utf-8") if isinstance(meta_raw[i], bytes) else meta_raw[i])
+            t_date = m.get("t_date", "")
+            if not t_date:
+                continue
+            # 解析日期字符串，支持多种格式
+            try:
+                if isinstance(t_date, (int, float)):
+                    s = str(int(t_date))
+                    t_date_fmt = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+                else:
+                    t_date_fmt = t_date[:10]
+                
+                dt = datetime.strptime(t_date_fmt, "%Y-%m-%d")
+                start_dt = datetime.strptime(self.start_date, "%Y-%m-%d")
+                end_dt = datetime.strptime(self.end_date, "%Y-%m-%d")
+                
+                if start_dt <= dt <= end_dt:
+                    self.features.append(features[i])
+                    self.labels.append(labels[i])
+                    self.meta.append(m)
+            except (ValueError, TypeError):
+                continue
+        
+        self.features = np.array(self.features)
+        self.labels = np.array(self.labels)
+    
+    def __len__(self):
+        return len(self.labels)
+    
+    def __getitem__(self, idx):
+        x = torch.from_numpy(self.features[idx]).float()
+        y = torch.tensor(self.labels[idx]).float()
+        return x, y
+
+
+class TimeBasedDatasetTopK(Dataset):
+    """
+    用于TopK预测的时间划分数据集（只返回features和meta）
+    """
+    def __init__(self, h5_path, split="test"):
+        super().__init__()
+        
+        if split == "train":
+            self.start_date, self.end_date = TRAIN_START, TRAIN_END
+        elif split == "val":
+            self.start_date, self.end_date = VAL_START, VAL_END
+        elif split == "test":
+            self.start_date, self.end_date = TEST_START, TEST_END
+        else:
+            raise ValueError(f"Unknown split: {split}")
+        
+        with h5py.File(h5_path, "r") as f:
+            if "train" in f:
+                grp = f["train"]
+            else:
+                grp = f
+            features = grp["features"][:]
+            meta_raw = grp["meta"][:]
+        
+        from datetime import datetime
+        self.features = []
+        self.meta = []
+        
+        for i in range(len(meta_raw)):
+            m = json.loads(meta_raw[i].decode("utf-8") if isinstance(meta_raw[i], bytes) else meta_raw[i])
+            t_date = m.get("t_date", "")
+            if not t_date:
+                continue
+            try:
+                if isinstance(t_date, (int, float)):
+                    s = str(int(t_date))
+                    t_date_fmt = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+                else:
+                    t_date_fmt = t_date[:10]
+                dt = datetime.strptime(t_date_fmt, "%Y-%m-%d")
+                start_dt = datetime.strptime(self.start_date, "%Y-%m-%d")
+                end_dt = datetime.strptime(self.end_date, "%Y-%m-%d")
+                if start_dt <= dt <= end_dt:
+                    self.features.append(features[i])
+                    self.meta.append(m)
+            except (ValueError, TypeError):
+                continue
+        
+        self.features = np.array(self.features)
+    
+    def __len__(self):
+        return len(self.meta)
+    
+    def __getitem__(self, idx):
+        x = torch.from_numpy(self.features[idx]).float()
+        return x, self.meta[idx]
 
 
 # ============================================================
@@ -323,35 +480,37 @@ def evaluate(model, dataloader, task):
 
 
 def train(args):
-    """完整训练流程"""
-    train_path = os.path.join(DATA_DIR, "train_data.h5")
-    if not os.path.exists(train_path):
-        print(f"[ERROR] 训练数据不存在: {train_path}")
+    """完整训练流程（时间划分 + L2正则 + 早停）"""
+    h5_path = os.path.join(DATA_DIR, "train_data.h5")
+    if not os.path.exists(h5_path):
+        print(f"[ERROR] 训练数据不存在: {h5_path}")
         print("请先运行: python lstm_data_prepare.py")
         return
     
     task = args.task
     print(f"[INFO] 训练任务: {task}")
-    print(f"[INFO] 加载训练数据: {train_path}")
+    print(f"[INFO] 加载数据: {h5_path}")
     
-    train_dataset = HL5Dataset(train_path, split="train")
-    test_path = os.path.join(DATA_DIR, "test_data.h5")
-    val_dataset = HL5Dataset(test_path, split="test")
+    # 使用时间划分数据集
+    train_dataset = TimeBasedDataset(h5_path, split="train")
+    val_dataset = TimeBasedDataset(h5_path, split="val")
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
                               num_workers=NUM_WORKERS, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False,
                              num_workers=NUM_WORKERS, pin_memory=True)
     
-    print(f"[INFO] 训练集: {len(train_dataset)} 条, 验证集: {len(val_dataset)} 条")
+    print(f"[INFO] 训练集: {len(train_dataset)} 条 ({TRAIN_START}~{TRAIN_END})")
+    print(f"[INFO] 验证集: {len(val_dataset)} 条 ({VAL_START}~{VAL_END})")
     
     # 模型
     model = LSTMAttention(task=task).to(DEVICE)
     print(f"[INFO] 模型参数量: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"[INFO] L2正则: weight_decay={WEIGHT_DECAY}, 早停: patience={PATIENCE}")
     
-    # 优化器和调度器
-    optimizer = Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    # 优化器（L2正则）+ 调度器
+    optimizer = Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
     
     if task == "regression":
         criterion = nn.MSELoss()
@@ -415,7 +574,8 @@ def train(args):
         
         # 早停
         if patience_counter >= PATIENCE:
-            print(f"\n[INFO] 早停触发 (patience={PATIENCE})")
+            print(f"\n[INFO] 早停触发 (patience={PATIENCE}, 连续{PATIENCE}个epoch无改善)")
+            print(f"[INFO] 最佳验证损失: {best_val_loss:.6f}")
             break
     
     # 保存训练历史（转换numpy类型）
@@ -449,15 +609,15 @@ def eval_model(args):
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     
-    # 加载测试集
-    test_path = os.path.join(DATA_DIR, "test_data.h5")
-    if not os.path.exists(test_path):
-        test_path = os.path.join(DATA_DIR, "train_data.h5")
+    # 加载测试集（时间划分）
+    h5_path = os.path.join(DATA_DIR, "train_data.h5")
+    if not os.path.exists(h5_path):
+        h5_path = os.path.join(DATA_DIR, "test_data.h5")
     
-    dataset = HL5Dataset(test_path, split="test")
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+    test_dataset = TimeBasedDataset(h5_path, split="test")
+    loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
     
-    print(f"[INFO] 测试集: {len(dataset)} 条")
+    print(f"[INFO] 测试集: {len(test_dataset)} 条 ({TEST_START}~{TEST_END})")
     
     metrics, preds, labels = evaluate(model, loader, task)
     
@@ -519,14 +679,14 @@ def predict(args):
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     
-    # 加载数据
+    # 加载数据（时间划分）
     data_path = os.path.join(DATA_DIR, "train_data.h5")
     
-    dataset = HL5DatasetTopK(data_path, split="test")
+    dataset = TimeBasedDatasetTopK(data_path, split="test")
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, 
                           num_workers=NUM_WORKERS, collate_fn=collate_fn_topk)
     
-    print(f"[INFO] 待预测样本: {len(dataset)} 条")
+    print(f"[INFO] 待预测样本（{TEST_START}~{TEST_END}）: {len(dataset)} 条")
     
     all_preds = []
     all_meta = []
